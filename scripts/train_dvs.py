@@ -1,4 +1,4 @@
-# finetuning of AnyView-DVS on unified Kubric-5D scenes (torch DDP, bf16 autocast).
+# finetuning of AnyView-DVS on unified Kubric-5D scenes (torch DDP or FSDP2, bf16 autocast).
 '''
 Finetune the released 1->1 dynamic view synthesis model on the Kubric-5D training scenes
 (unified scene layout, videos or frames variant). Plain torch DistributedDataParallel;
@@ -16,6 +16,13 @@ Example (2 GPUs):
     torchrun --nproc_per_node=2 scripts/train_dvs.py --data-root /data/Kubric5D \
         --ckpt checkpoints/anyview_dvs_2b.pt --tokenizer checkpoints/tokenizer.pth \
         --out outputs/finetune --max-steps 500
+
+FSDP2 (--parallel fsdp) shards parameters, gradients and AdamW state across all ranks, one
+shard unit per transformer block, instead of replicating them as DDP does. Each GPU then holds
+~1/N of the ~32 GB fp32 weights + grads + optimizer state. --fsdp-param-dtype fp32 (default)
+keeps the DDP numerics (fp32 master weights, bf16 matmuls via autocast); bf16 also halves the
+all-gather traffic. Example (4 GPUs):
+    torchrun --nproc_per_node=4 scripts/train_dvs.py ... --parallel fsdp
 '''
 
 import argparse
@@ -59,6 +66,12 @@ def parse_args():
     parser.add_argument('--log-every', type=int, default=10, help='Log interval in steps (train_log.jsonl)')
     parser.add_argument('--num-workers', type=int, default=2, help='DataLoader workers per process')
     parser.add_argument('--seed', type=int, default=0, help='Base random seed (rank is added)')
+    parser.add_argument('--parallel', type=str, default='ddp', choices=['ddp', 'fsdp'],
+                        help='ddp: replicate the model on every GPU; '
+                             'fsdp: FSDP2-shard params, grads and optimizer state')
+    parser.add_argument('--fsdp-param-dtype', type=str, default='fp32', choices=['fp32', 'bf16'],
+                        help='FSDP compute-parameter dtype: fp32 matches the DDP recipe; '
+                             'bf16 halves all-gather traffic')
     args = parser.parse_args()
     return args
 
@@ -189,7 +202,40 @@ def training_loss(pipe, entries, sigma_data=1.0, cond_aug_range=(0.001, 0.01),
     return loss
 
 
-def save_checkpoint(dit_module, path, step):
+def apply_fsdp(dit, param_dtype='fp32'):
+    '''
+    FSDP2: one shard unit per transformer block (all-gathered just before it runs, freed
+    right after), plus a root unit for the embedders and final layers. Gradients are
+    reduce-scattered in fp32. Parameters this task never uses (view-0 timestep embedder)
+    are fine: FSDP2 needs no find_unused_parameters.
+    '''
+    import torch
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    mp = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16 if param_dtype == 'bf16' else torch.float32,
+        reduce_dtype=torch.float32)
+    for block in dit.blocks:  # activation-checkpoint wrappers are sharded as they are
+        fully_shard(block, mp_policy=mp)
+    fully_shard(dit, mp_policy=mp)
+    return dit
+
+
+def full_state_dict(dit_module):
+    '''
+    Full (unsharded) state dict on CPU. Under FSDP this is a collective: every rank must call
+    it; ranks other than 0 get an empty dict.
+    '''
+    from torch.distributed.tensor import DTensor
+
+    if any(isinstance(p, DTensor) for p in dit_module.parameters()):
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+        return get_model_state_dict(
+            dit_module, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+    return dit_module.state_dict()
+
+
+def save_checkpoint(state_dict, path, step):
     '''
     Flat bf16 state dict under the net. prefix (same size and layout as the released
     checkpoint), loadable by anyview.pipe.load_pipeline.
@@ -198,7 +244,7 @@ def save_checkpoint(dit_module, path, step):
     from anyview.pipe import SAC_WRAP
 
     state = {'net.' + SAC_WRAP.sub('', k): v.detach().to('cpu', torch.bfloat16)
-             for (k, v) in dit_module.state_dict().items()}
+             for (k, v) in state_dict.items()}
     torch.save({'model': state, 'step': step}, path)
 
 
@@ -222,14 +268,18 @@ def main():
     is_main = rank == 0
     if is_main:
         os.makedirs(args.out, exist_ok=True)
-        print(f'world_size={world_size} batch/gpu={args.batch_size} steps={args.max_steps} '
-              f'res={args.resolution} sac={args.sac_mode}')
+        print(f'world_size={world_size} parallel={args.parallel} batch/gpu={args.batch_size} '
+              f'steps={args.max_steps} res={args.resolution} sac={args.sac_mode}')
 
     config = AnyViewConfig(checkpoint_path=args.ckpt, tokenizer_path=args.tokenizer)
     vae = load_vae(config.tokenizer_path, device)
     dit = load_dit(config, sac_mode=args.sac_mode).to(device=device, dtype=torch.float32).train()
     dit_ddp = dit
-    if world_size > 1:
+    if args.parallel == 'fsdp':
+        assert dist.is_initialized(), '--parallel fsdp needs torchrun'
+        # Shards in place: dit itself becomes the FSDP module (no wrapper object).
+        dit_ddp = dit = apply_fsdp(dit, args.fsdp_param_dtype)
+    elif world_size > 1:
         # The released checkpoint carries parameters this task never touches (view-0 timestep
         # embedder, rope buffers), so DDP must not wait for their gradients.
         dit_ddp = DistributedDataParallel(dit, device_ids=[local_rank], find_unused_parameters=True)
@@ -248,6 +298,7 @@ def main():
         raise SystemExit(f'rank {rank}: no batches (dataset of {len(dataset)} scenes is too small for '
                          f'{world_size} processes x batch {args.batch_size})')
 
+    # Built after sharding, so under FSDP each rank keeps AdamW state for its shard only.
     optimizer = torch.optim.AdamW(dit.parameters(), lr=args.lr, betas=(0.9, 0.99),
                                   weight_decay=args.weight_decay, fused=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -284,10 +335,13 @@ def main():
                 with open(log_path, 'a') as f:
                     f.write(json.dumps(record) + '\n')
                 t_last = now
-            if is_main and (step % args.save_every == 0 or step == args.max_steps):
-                path = os.path.join(args.out, f'anyview_dvs_step{step:06d}.pt')
-                save_checkpoint(dit, path, step)
-                print(f'saved {path}')
+            if step % args.save_every == 0 or step == args.max_steps:
+                state = full_state_dict(dit)  # collective under FSDP: all ranks call it
+                if is_main:
+                    path = os.path.join(args.out, f'anyview_dvs_step{step:06d}.pt')
+                    save_checkpoint(state, path, step)
+                    print(f'saved {path}')
+                del state
         epoch += 1
 
     if dist.is_initialized():
